@@ -202,17 +202,23 @@ def main():
     new_comp = comparable(new_snap)
 
     course_changes = diff_courses(old_comp["courses"], new_comp["courses"])
-    gpa_changed = old_comp["gpa"] != new_comp["gpa"]
-    rank_changed = (
-        old_comp["dept_rank"] != new_comp["dept_rank"]
-        or old_comp["major_rank"] != new_comp["major_rank"]
-    )
 
     is_first_run = not old_snap
-    anything_changed = bool(course_changes) or gpa_changed or rank_changed
+    # Trigger only on the student's own grade events: a course newly graded
+    # or its grade/gp changed ("课程出分"). GPA/credits are downstream of
+    # those and never move on their own. Ranking is deliberately NOT a
+    # trigger — someone else getting graded can shift your rank without any
+    # of your own grades changing, and we don't treat that as an event: no
+    # email, no snapshot rewrite, so the stored history stays aligned with
+    # your own grade timeline rather than jittering with peers.
+    grade_event = bool(course_changes)
 
-    if not anything_changed and not is_first_run:
-        print("[*] No changes since last run — snapshot left untouched.")
+    if not grade_event and not is_first_run:
+        if old_comp["dept_rank"] != new_comp["dept_rank"] or old_comp["major_rank"] != new_comp["major_rank"]:
+            print("[*] Only ranking moved (peers graded) — not an event; "
+                  "snapshot left untouched.")
+        else:
+            print("[*] No changes since last run — snapshot left untouched.")
         return
 
     # Build + send notification.
@@ -237,10 +243,9 @@ def main():
         )
         send_email(subject, body)
 
-    # Persist — only when something actually moved, so the workflow can
+    # Persist only on a real grade event (or init), so the workflow can
     # skip the commit and let the repo go idle after grade season.
-    if anything_changed or is_first_run:
-        save_grades(new_snap)
+    save_grades(new_snap)
 
 
 if __name__ == "__main__":
