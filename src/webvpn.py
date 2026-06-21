@@ -9,14 +9,15 @@ hostname, hex-encoded and prefixed with the IV.
     https://webvpn.fudan.edu.cn/https/<iv><ciphertext>/student/for-std/grade/sheet/
 
 The URL-encoding helpers come first; ``WebVPNSession`` below them owns
-the full IDP (id.fudan.edu.cn) login that establishes the VPN session.
+the full IDP (id.fudan.edu.cn) login that establishes the VPN session,
+plus the per-host SSO handshake fdjwgl needs.
 """
 
 import html as html_mod
 import re
 import base64
 from binascii import hexlify, unhexlify
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
 
 import requests
 from Crypto.Cipher import AES
@@ -24,6 +25,29 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
 from src import config
+
+
+def _extract_lck(resp: requests.Response) -> str | None:
+    """Pull the ``lck`` token out of an IDP redirect response.
+
+    The IDP drops lck into the *fragment* of its SPA landing URL
+    (``/ac/#/index?lck=…``), so we scan the redirect history's Location
+    headers, every visited URL, and finally the page body.
+    """
+    candidates: list[str] = []
+    for hop in (resp.history or []):
+        candidates.append(hop.url)
+        location = hop.headers.get("Location", "")
+        if location:
+            candidates.append(location)
+            candidates.append(urljoin(hop.url, location))
+    candidates.append(resp.url)
+    candidates.append(resp.text or "")
+    for src in candidates:
+        match = re.search(r"lck=([^&#\"'\s]+)", src)
+        if match:
+            return match.group(1)
+    return None
 
 
 def encrypt_host(hostname: str) -> str:
@@ -193,6 +217,140 @@ class WebVPNSession:
         kwargs.setdefault("timeout", 30)
         return self.session.post(url, **kwargs)
 
+    def authenticate_grade(self, student_id: str = None, password: str = None) -> bool:
+        """SSO into fdjwgl *through* WebVPN, after :meth:`login` established
+        the gateway session.
+
+        fdjwgl has no CAS bootstrap endpoint of its own (unlike iCourse's
+        ``casapi``), so we trigger its SSO by hitting the grade-sheet URL:
+        fdjwgl bounces to its ``/student/sso/login`` → IDP
+        ``authenticate`` → IDP SPA landing page, all rewritten by the VPN
+        gateway.  We grab ``lck`` from that chain, run the IDP steps with
+        ``entityId=fdjwgl``, and follow the resulting ticket back into
+        fdjwgl — planting its session cookie on the way.
+        """
+        student_id = student_id or config.STUDENT_ID
+        password = password or config.PASSWORD
+        if not student_id or not password:
+            raise ValueError(
+                "Student ID and password are required. "
+                "Set StuId and UISPsw environment variables."
+            )
+
+        entity_id = config.GRADE_BASE
+        idp_vpn_base = get_vpn_url(config.IDP_BASE)
+
+        print("[grade/1] Triggering fdjwgl SSO redirect...")
+        resp = self.session.get(
+            get_vpn_url(config.GRADE_HOME_URL),
+            allow_redirects=True, timeout=90,
+        )
+        lck = _extract_lck(resp)
+        if not lck:
+            raise RuntimeError(
+                "Failed to extract lck from fdjwgl SSO redirect "
+                f"(final URL: {resp.url[:120]})"
+            )
+        print("    lck: OK")
+
+        print("[grade/2] Querying auth methods (via VPN)...")
+        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/queryAuthMethods")
+        resp = self.session.post(
+            url,
+            json={"lck": lck, "entityId": entity_id},
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{idp_vpn_base}/ac/",
+                "Origin": config.WEBVPN_BASE,
+            },
+            timeout=60,
+        )
+        data = resp.json()
+        request_type = data.get("requestType", "chain_type")
+        auth_chain_code = ""
+        for method in data.get("data", []):
+            if method.get("moduleCode") == "userAndPwd":
+                auth_chain_code = method.get("authChainCode", "")
+                break
+        if not auth_chain_code:
+            raise RuntimeError("No authChainCode for fdjwgl")
+        print("    authChainCode: OK")
+
+        print("[grade/3] Getting RSA public key (via VPN)...")
+        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/getJsPublicKey")
+        resp = self.session.get(
+            url, headers={"Referer": f"{idp_vpn_base}/ac/"}, timeout=60,
+        )
+        pub_key_b64 = resp.json().get("data", "")
+        if not pub_key_b64:
+            raise RuntimeError("Failed to get public key via VPN")
+        print("    Got RSA public key")
+
+        print("[grade/4] Encrypting password...")
+        encrypted_password = self._encrypt_password(password, pub_key_b64)
+
+        print("[grade/5] Executing authentication (via VPN)...")
+        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/authExecute")
+        payload = {
+            "authModuleCode": "userAndPwd",
+            "authChainCode": auth_chain_code,
+            "entityId": entity_id,
+            "requestType": request_type,
+            "lck": lck,
+            "authPara": {
+                "loginName": student_id,
+                "password": encrypted_password,
+                "verifyCode": "",
+            },
+        }
+        resp = self.session.post(
+            url, json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{idp_vpn_base}/ac/",
+                "Origin": config.WEBVPN_BASE,
+            },
+            timeout=60,
+        )
+        data = resp.json()
+        if str(data.get("code")) != "200":
+            raise RuntimeError(f"fdjwgl SSO auth failed (code={data.get('code')})")
+        login_token = data.get("loginToken", "")
+        if not login_token:
+            raise RuntimeError("No loginToken in fdjwgl SSO response")
+        print("    loginToken: OK")
+
+        print("[grade/6] Getting CAS ticket (via VPN)...")
+        url = get_vpn_url(f"{config.IDP_BASE}/idp/authCenter/authnEngine")
+        resp = self.session.post(
+            url, data={"loginToken": login_token},
+            headers={
+                "Referer": f"{idp_vpn_base}/ac/",
+                "Origin": config.WEBVPN_BASE,
+            },
+            timeout=60,
+        )
+        html = resp.text
+        match = re.search(r'locationValue\s*=\s*"([^"]*ticket=[^"]*)"', html)
+        if not match:
+            match = re.search(r'(https?://[^\s"\'<>]*ticket=[^\s"\'<>]*)', html)
+        if not match:
+            raise RuntimeError(
+                f"Failed to extract fdjwgl ticket URL (len={len(html)})"
+            )
+        # locationValue targets fdjwgl directly; the VPN gateway may have
+        # already rewritten it, otherwise convert it ourselves.
+        ticket_url = html_mod.unescape(match.group(1))
+        if not ticket_url.startswith(config.WEBVPN_BASE):
+            ticket_url = get_vpn_url(ticket_url)
+        print("    Ticket extracted.")
+
+        print("[grade/7] Following ticket into fdjwgl (via VPN)...")
+        resp = self.session.get(ticket_url, allow_redirects=True, timeout=90)
+        print(f"    Status: {resp.status_code}")
+        print("[*] fdjwgl SSO successful via WebVPN!")
+        return True
+
     # ── IDP login steps (direct to id.fudan.edu.cn, no VPN) ──────────────
 
     def _get_auth_context(self) -> tuple[str, str]:
@@ -345,22 +503,20 @@ class WebVPNSession:
         The WebVPN gateway only marks the session active *after* it finishes
         validating the ticket server-side — a client-side timeout mid-body
         leaves the cookie planted but the session unvalidated, so the next
-        request bounces back to ``/login``.  We use a generous timeout and
-        then probe the portal to confirm the session actually took.
+        request bounces back to ``/login``.  We therefore require a
+        *completed* 200 response (generous timeout) rather than trusting
+        the cookie alone.
+
+        We deliberately do not probe the portal root afterwards: the VPN
+        gateway is load-balanced (``route`` cookie), so a portal probe can
+        land on a backend that does not hold our session and 302 to
+        ``/login`` even when the session is fine.  The real liveness check
+        is whether a protected resource answers — that happens in
+        :meth:`authenticate_grade`.
         """
         resp = self.session.get(ticket_url, allow_redirects=True, timeout=90)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Failed to establish WebVPN session (status={resp.status_code})"
-            )
-        # Confirm the session is live: a cold session 302s to /login.
-        probe = self.session.get(
-            config.WEBVPN_BASE + "/", allow_redirects=False, timeout=15
-        )
-        location = probe.headers.get("Location", "")
-        if probe.status_code == 302 and "/login" in location:
-            raise RuntimeError(
-                "WebVPN session not active after ticket follow "
-                "(portal still redirects to /login)"
             )
         print("    Session established.")
