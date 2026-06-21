@@ -36,13 +36,23 @@ jobs:
         UISPsw: ${{ secrets.UIS_PASSWORD }}
         QQ_SMTP: ${{ secrets.QQ_SMTP_AUTH_CODE }}
         QQ_EMAIL_SENDER: ${{ secrets.QQ_EMAIL_SENDER }}
+        # Optional: internal major id, enables 专业排名 (major ranking).
+        MAJOR_ASSOC: ${{ secrets.MAJOR_ASSOC }}
+        # Default: access fdjwgl through WebVPN (GitHub runners are off-campus).
+        # The crawler only rewrites grades_encrypted.json when data changes.
       run: python crawl_grades.py
-    
-    - name: Commit and push changes
+
+    - name: Commit and push changes (only if grades changed)
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add grades_encrypted.json # Add the encrypted grades file
-        git commit -m "Update encrypted grades" || echo "No changes to commit"
+        git add grades_encrypted.json
+        if git diff --cached --quiet; then
+          echo "No change in grades_encrypted.json — skipping commit/push."
+          echo "Leaving the repo quiet lets GitHub auto-disable the schedule"
+          echo "after the grade season ends, saving Actions minutes."
+          exit 0
+        fi
+        git commit -m "Update encrypted grades"
         git pull --rebase
         git push
