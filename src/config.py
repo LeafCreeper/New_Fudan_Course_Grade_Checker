@@ -46,6 +46,12 @@ GRADES_FILE = os.environ.get("GRADES_FILE", "grades_encrypted.json")
 # running on the campus network (e.g. local testing).
 USE_WEBVPN = os.environ.get("USE_DIRECT", "").strip().lower() not in ("1", "true", "yes")
 
+# ── Ranking scope ────────────────────────────────────────────────────────
+# Department ranking needs zero config — the server infers the student's
+# department/grade from the grade-sheet ID alone.  Major ranking needs the
+# internal majorAssoc id; leave blank to skip major ranking.
+MAJOR_ASSOC = os.environ.get("MAJOR_ASSOC", "")
+
 # ── Browser fingerprint ──────────────────────────────────────────────────
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
