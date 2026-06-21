@@ -341,30 +341,26 @@ class WebVPNSession:
     def _establish_session(self, ticket_url: str):
         """Step 7: follow the ticket URL to plant the WebVPN session cookie.
 
-        Retries on timeout: the gateway sometimes ships the cookie before
-        finishing the response body, so a present ``wengine_vpn_ticket``
-        cookie counts as success even on timeout.
+        CAS tickets are single-use, so this GET must complete in one shot.
+        The WebVPN gateway only marks the session active *after* it finishes
+        validating the ticket server-side — a client-side timeout mid-body
+        leaves the cookie planted but the session unvalidated, so the next
+        request bounces back to ``/login``.  We use a generous timeout and
+        then probe the portal to confirm the session actually took.
         """
-        for attempt in range(3):
-            try:
-                resp = self.session.get(
-                    ticket_url, allow_redirects=True, timeout=20
-                )
-                if resp.status_code == 200:
-                    print("    Session established.")
-                    return
-                raise RuntimeError(
-                    f"Failed to establish WebVPN session (status={resp.status_code})"
-                )
-            except requests.exceptions.Timeout:
-                has_ticket = any(
-                    "wengine_vpn_ticket" in c.name
-                    for c in self.session.cookies
-                )
-                if has_ticket:
-                    print("    Session cookie set despite timeout.")
-                    return
-                if attempt < 2:
-                    print(f"    Timeout, retrying ({attempt + 2}/3)...")
-                    continue
-                raise
+        resp = self.session.get(ticket_url, allow_redirects=True, timeout=90)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Failed to establish WebVPN session (status={resp.status_code})"
+            )
+        # Confirm the session is live: a cold session 302s to /login.
+        probe = self.session.get(
+            config.WEBVPN_BASE + "/", allow_redirects=False, timeout=15
+        )
+        location = probe.headers.get("Location", "")
+        if probe.status_code == 302 and "/login" in location:
+            raise RuntimeError(
+                "WebVPN session not active after ticket follow "
+                "(portal still redirects to /login)"
+            )
+        print("    Session established.")
